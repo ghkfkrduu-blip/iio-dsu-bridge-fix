@@ -225,14 +225,29 @@ func sanitizeFloat32(v float32) float32 {
 
 // Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
+	// --- START POPRAWKI: Twarda strefa martwa (Deadzone) dla ROG Ally ---
+	// Eliminuje szum sprzętowy sensora, który powoduje powolny dryft kamery.
+	const gyroDeadzone = 0.015 // Zwiększ na 0.020 lub 0.025, jeśli po kompilacji nadal minimalnie ucieka.
+
+	filterGyro := func(val float64) float64 {
+		if math.Abs(val) < gyroDeadzone {
+			return 0.0
+		}
+		return val
+	}
+	// --- KONIEC POPRAWKI ---
+
 	// convert units for DSU and sanitize to prevent NaN/Infinity crashes
 	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665)) // m/s^2 → g
 	ay := sanitizeFloat32(float32(sample.Accel.Y / 9.80665))
 	az := sanitizeFloat32(float32(sample.Accel.Z / 9.80665))
+	
 	const rad2deg = 180.0 / math.Pi
-	gx := sanitizeFloat32(float32(sample.Gyro.X * rad2deg)) // rad/s → deg/s
-	gy := sanitizeFloat32(float32(sample.Gyro.Y * rad2deg))
-	gz := sanitizeFloat32(float32(sample.Gyro.Z * rad2deg))
+	
+	// Aplikujemy filtr na żyroskop przed konwersją na stopnie (DSU)
+	gx := sanitizeFloat32(float32(filterGyro(sample.Gyro.X) * rad2deg))
+	gy := sanitizeFloat32(float32(filterGyro(sample.Gyro.Y) * rad2deg))
+	gz := sanitizeFloat32(float32(filterGyro(sample.Gyro.Z) * rad2deg))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
