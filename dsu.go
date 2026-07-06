@@ -223,48 +223,40 @@ func sanitizeFloat32(v float32) float32 {
 	return v
 }
 
-var bufferDrainTime time.Time
+// Dodajemy globalny zegar startujący przy odpaleniu skryptu!
+var serverStartTime = time.Now()
+
 // Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	// --- START POPRAWKI ---
-	now := time.Now()
+	// --- START OSTATECZNEJ POPRAWKI ---
 	
-	// 1. LIKWIDACJA OPÓŹNIENIA (Buffer Bloat)
-	if !bufferDrainTime.IsZero() && now.Sub(bufferDrainTime) < 5*time.Millisecond {
-		return
-	}
-	bufferDrainTime = now
+	// 1. NAPRAWA CZASU (Zabezpieczenie przed błędem "float" w emulatorze)
+	// Zamiast wysyłać gigantyczny czas z kernela, liczymy mikrosekundy od zera
+	// przy każdym restarcie usługi. Matematyka w emulatorze pozostanie precyzyjna.
+	tsUS := uint64(time.Since(serverStartTime).Microseconds())
 
-	// 2. PODWÓJNY FILTR ŻYROSKOPU (Deadzone + Hard Clamp)
-	const gyroDeadzone = 0.025 
-	const gyroMaxLimit = 35.0 // Limit bezpieczeństwa: ok. 2000 stopni/s (sprzętowy limit czujnika)
+	// 2. NAPRAWA SENSOR FUSION (Zabezpieczenie przed "freestylem")
+	// Odcinamy zabrudzony sygnał z akcelerometru ROG Ally.
+	// Wysyłamy do emulatora fałszywy wektor grawitacji (idealne 1G w dół).
+	// Gra nigdy nie zgubi orientacji, a celowanie będzie w 100% zależne od żyroskopu.
+	ax := float32(0.0)
+	ay := float32(1.0) 
+	az := float32(0.0)
+
+	// 3. Twardy filtr dla żyroskopu (blokada szumów i błędów krytycznych)
+	const gyroDeadzone = 0.025
+	const gyroMaxLimit = 35.0 // Limit ucinający przepełnienie bufora
 
 	filterGyro := func(val float64) float64 {
-		// A. Odcięcie szumów (żeby kamera stała w miejscu, gdy konsola leży)
-		if math.Abs(val) < gyroDeadzone {
-			return 0.0
-		}
-		// B. Odcięcie błędu przepełnienia czujnika (żeby kamera nie wariowała po szybkim ruchu)
-		if val > gyroMaxLimit {
-			return gyroMaxLimit
-		}
-		if val < -gyroMaxLimit {
-			return -gyroMaxLimit
-		}
+		if math.Abs(val) < gyroDeadzone { return 0.0 }
+		if val > gyroMaxLimit { return gyroMaxLimit }
+		if val < -gyroMaxLimit { return -gyroMaxLimit }
 		return val
 	}
-	// --- KONIEC POPRAWKI ---
+	// --- KONIEC OSTATECZNEJ POPRAWKI ---
 
-	tsUS := sample.TSus
-
-	// convert units for DSU and sanitize to prevent NaN/Infinity crashes
-	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665)) // m/s^2 → g
-	ay := sanitizeFloat32(float32(sample.Accel.Y / 9.80665))
-	az := sanitizeFloat32(float32(sample.Accel.Z / 9.80665))
-	
 	const rad2deg = 180.0 / math.Pi
 	
-	// Aplikujemy filtry na żyroskop przed konwersją na stopnie (DSU)[cite: 2]
 	gx := sanitizeFloat32(float32(filterGyro(sample.Gyro.X) * rad2deg))
 	gy := sanitizeFloat32(float32(filterGyro(sample.Gyro.Y) * rad2deg))
 	gz := sanitizeFloat32(float32(filterGyro(sample.Gyro.Z) * rad2deg))
@@ -278,6 +270,7 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 		s.conn.WriteToUDP(pkt, a)
 	}
 	
+	now := time.Now()
 	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
 		pktInfo := s.buildControllerInfo(0, 2)
 		for _, a := range s.subs {
