@@ -223,23 +223,34 @@ func sanitizeFloat32(v float32) float32 {
 	return v
 }
 
+var bufferDrainTime time.Time
+
 // Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	// --- START POPRAWKI ---
-	// 1. Twarda strefa martwa dla żyroskopu (odcięcie szumu)
-	const gyroDeadzone = 0.020 // Podniesione do 0.020 dla lepszej stabilności
+	// --- START POPRAWKI: LIKWIDACJA BUFFER BLOAT (Opóźnienia) ---
+	now := time.Now()
+	
+	// Zawór zrzutowy: Jeśli czytamy klatki z prędkością szybszą niż 5ms (powyżej 200Hz),
+	// to znaczy, że system próbuje przepchać stary zator z bufora.
+	// Zjadamy te klatki (return) i ich nie wysyłamy, żeby w ułamek sekundy dogonić czas rzeczywisty!
+	if !bufferDrainTime.IsZero() && now.Sub(bufferDrainTime) < 5*time.Millisecond {
+		return
+	}
+	bufferDrainTime = now
 
+	// Twarda strefa martwa dla żyroskopu (podniesiona do 0.025 dla stabilności absolutnej)
+	const gyroDeadzone = 0.025 
 	filterGyro := func(val float64) float64 {
 		if math.Abs(val) < gyroDeadzone {
 			return 0.0
 		}
 		return val
 	}
-
-	// 2. Wymuszenie czasu rzeczywistego (Naprawa opóźnienia i kręcenia)
-	// Omijamy uszkodzone timestampy z jądra SteamOS, które zapętlają obrót.
-	realTimeUS := uint64(time.Now().UnixNano() / 1000)
 	// --- KONIEC POPRAWKI ---
+
+	// Wracamy do ORYGINALNEGO czasu sprzętowego. 
+	// Dzięki zaworowi powyżej klatki będą zawsze świeże, a emulator dostanie poprawną deltę czasu.
+	tsUS := sample.TSus
 
 	// convert units for DSU and sanitize to prevent NaN/Infinity crashes
 	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665)) // m/s^2 → g
@@ -257,12 +268,11 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 	defer s.mu.Unlock()
 	for _, a := range s.subs {
 		s.pkt++
-		// Wstrzykujemy realTimeUS zamiast zepsutego sample.TSus
-		pkt := s.buildControllerData(0, true, s.pkt, realTimeUS, ax, ay, az, gx, gy, gz)
+		pkt := s.buildControllerData(0, true, s.pkt, tsUS, ax, ay, az, gx, gy, gz)
 		if s.debug && (s.pkt%100 == 1) { dumpPacket("TX", pkt) } 
 		s.conn.WriteToUDP(pkt, a)
 	}
-	now := time.Now()
+	
 	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
 		pktInfo := s.buildControllerInfo(0, 2)
 		for _, a := range s.subs {
