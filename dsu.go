@@ -225,9 +225,9 @@ func sanitizeFloat32(v float32) float32 {
 
 // Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	// --- START POPRAWKI: Twarda strefa martwa (Deadzone) dla ROG Ally ---
-	// Eliminuje szum sprzętowy sensora, który powoduje powolny dryft kamery.
-	const gyroDeadzone = 0.015 // Zwiększ na 0.020 lub 0.025, jeśli po kompilacji nadal minimalnie ucieka.
+	// --- START POPRAWKI ---
+	// 1. Twarda strefa martwa dla żyroskopu (odcięcie szumu)
+	const gyroDeadzone = 0.020 // Podniesione do 0.020 dla lepszej stabilności
 
 	filterGyro := func(val float64) float64 {
 		if math.Abs(val) < gyroDeadzone {
@@ -235,6 +235,10 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 		}
 		return val
 	}
+
+	// 2. Wymuszenie czasu rzeczywistego (Naprawa opóźnienia i kręcenia)
+	// Omijamy uszkodzone timestampy z jądra SteamOS, które zapętlają obrót.
+	realTimeUS := uint64(time.Now().UnixNano() / 1000)
 	// --- KONIEC POPRAWKI ---
 
 	// convert units for DSU and sanitize to prevent NaN/Infinity crashes
@@ -253,7 +257,8 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 	defer s.mu.Unlock()
 	for _, a := range s.subs {
 		s.pkt++
-		pkt := s.buildControllerData(0, true, s.pkt, sample.TSus, ax, ay, az, gx, gy, gz)
+		// Wstrzykujemy realTimeUS zamiast zepsutego sample.TSus
+		pkt := s.buildControllerData(0, true, s.pkt, realTimeUS, ax, ay, az, gx, gy, gz)
 		if s.debug && (s.pkt%100 == 1) { dumpPacket("TX", pkt) } 
 		s.conn.WriteToUDP(pkt, a)
 	}
