@@ -224,32 +224,37 @@ func sanitizeFloat32(v float32) float32 {
 }
 
 var bufferDrainTime time.Time
-
 // Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	// --- START POPRAWKI: LIKWIDACJA BUFFER BLOAT (Opóźnienia) ---
+	// --- START POPRAWKI ---
 	now := time.Now()
 	
-	// Zawór zrzutowy: Jeśli czytamy klatki z prędkością szybszą niż 5ms (powyżej 200Hz),
-	// to znaczy, że system próbuje przepchać stary zator z bufora.
-	// Zjadamy te klatki (return) i ich nie wysyłamy, żeby w ułamek sekundy dogonić czas rzeczywisty!
+	// 1. LIKWIDACJA OPÓŹNIENIA (Buffer Bloat)
 	if !bufferDrainTime.IsZero() && now.Sub(bufferDrainTime) < 5*time.Millisecond {
 		return
 	}
 	bufferDrainTime = now
 
-	// Twarda strefa martwa dla żyroskopu (podniesiona do 0.025 dla stabilności absolutnej)
+	// 2. PODWÓJNY FILTR ŻYROSKOPU (Deadzone + Hard Clamp)
 	const gyroDeadzone = 0.025 
+	const gyroMaxLimit = 35.0 // Limit bezpieczeństwa: ok. 2000 stopni/s (sprzętowy limit czujnika)
+
 	filterGyro := func(val float64) float64 {
+		// A. Odcięcie szumów (żeby kamera stała w miejscu, gdy konsola leży)
 		if math.Abs(val) < gyroDeadzone {
 			return 0.0
+		}
+		// B. Odcięcie błędu przepełnienia czujnika (żeby kamera nie wariowała po szybkim ruchu)
+		if val > gyroMaxLimit {
+			return gyroMaxLimit
+		}
+		if val < -gyroMaxLimit {
+			return -gyroMaxLimit
 		}
 		return val
 	}
 	// --- KONIEC POPRAWKI ---
 
-	// Wracamy do ORYGINALNEGO czasu sprzętowego. 
-	// Dzięki zaworowi powyżej klatki będą zawsze świeże, a emulator dostanie poprawną deltę czasu.
 	tsUS := sample.TSus
 
 	// convert units for DSU and sanitize to prevent NaN/Infinity crashes
@@ -259,7 +264,7 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 	
 	const rad2deg = 180.0 / math.Pi
 	
-	// Aplikujemy filtr na żyroskop przed konwersją na stopnie (DSU)
+	// Aplikujemy filtry na żyroskop przed konwersją na stopnie (DSU)[cite: 2]
 	gx := sanitizeFloat32(float32(filterGyro(sample.Gyro.X) * rad2deg))
 	gy := sanitizeFloat32(float32(filterGyro(sample.Gyro.Y) * rad2deg))
 	gz := sanitizeFloat32(float32(filterGyro(sample.Gyro.Z) * rad2deg))
