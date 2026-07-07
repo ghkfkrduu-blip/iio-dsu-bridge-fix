@@ -35,9 +35,9 @@ var (
 
 const (
 	calibrationFrames = 300
-	alpha             = 0.90
+	alpha             = 0.60  // Zmniejszono z 0.90 - zapobiega efektowi "zamulenia" kamery
 	gyroDeadzone      = 0.004
-	spikeLimit        = 8.0
+	spikeLimit        = 8.0   // ok. 450 stopni na sekundę (ludzka ręka rzadko tyle osiąga)
 )
 
 func lowPass(prev, current float64) float64 {
@@ -352,9 +352,12 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 	gy := sample.Gyro.Y
 	gz := sample.Gyro.Z
 
+	// BEZPIECZEŃSTWO: Odrzucanie sprzętowych błędów NaN/Inf z jądra Linuxa
+	if math.IsNaN(gx) || math.IsNaN(gy) || math.IsNaN(gz) || math.IsInf(gx, 0) {
+		return // Tę jedną, zepsutą klatkę możemy bezpiecznie usunąć
+	}
+
 	// 1. KALIBRACJA BIASU
-	// Po uruchomieniu programu przez pierwsze 300 klatek zbieramy próbki
-	// WAŻNE: Konsola musi w tym czasie leżeć płasko i nieruchomo!
 	if !initialized {
 		calibX += gx
 		calibY += gy
@@ -362,63 +365,58 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 		calibSamples++
 
 		if calibSamples >= calibrationFrames {
-			gyroBiasX = calibX / float64(calibSamples)
-			gyroBiasY = calibY / float64(calibSamples)
-			gyroBiasZ = calibZ / float64(calibSamples)
+			gyroBiasX = calibX / float64(calibrationFrames)
+			gyroBiasY = calibY / float64(calibrationFrames)
+			gyroBiasZ = calibZ / float64(calibrationFrames)
 			initialized = true
 			fmt.Printf("Kalibracja zakonczona. Bias -> X: %f, Y: %f, Z: %f\n", gyroBiasX, gyroBiasY, gyroBiasZ)
 		}
-		return // Czekamy na koniec kalibracji, nie wysyłamy śmieci do emulatora
-	}
 
-	// 2. ODEJMOWANIE BIASU (usunięcie głównego źródła dryftu)
-	gx -= gyroBiasX
-	gy -= gyroBiasY
-	gz -= gyroBiasZ
+		// NAPRAWA BŁĘDU LOGICZNEGO: 
+		// Nie używamy "return"! Wysyłamy do emulatora puste zera, 
+		// aby utrzymać połączenie z grą i nie zablokować wysyłki Info Packet.
+		gx, gy, gz = 0.0, 0.0, 0.0
 
-	// 3. SPIKE KILLER (odrzucanie pojedynczych błędnych próbek z IIO)
-	if math.Abs(gx) > spikeLimit {
+	} else {
+		// --- NORMALNY PIPELINE PO KALIBRACJI ---
+		
+		// 2. ODEJMOWANIE BIASU (usunięcie głównego źródła dryftu)
+		gx -= gyroBiasX
+		gy -= gyroBiasY
+		gz -= gyroBiasZ
+
+		// 3. SPIKE KILLER
+		if math.Abs(gx) > spikeLimit { gx = filtGX }
+		if math.Abs(gy) > spikeLimit { gy = filtGY }
+		if math.Abs(gz) > spikeLimit { gz = filtGZ }
+
+		// 4. LOW PASS FILTER (wygładzanie szumu)
+		filtGX = lowPass(filtGX, gx)
+		filtGY = lowPass(filtGY, gy)
+		filtGZ = lowPass(filtGZ, gz)
+
 		gx = filtGX
-	}
-	if math.Abs(gy) > spikeLimit {
 		gy = filtGY
-	}
-	if math.Abs(gz) > spikeLimit {
 		gz = filtGZ
+
+		// 5. ADAPTACYJNA DEADZONE
+		if math.Abs(gx) < gyroDeadzone { gx = 0 }
+		if math.Abs(gy) < gyroDeadzone { gy = 0 }
+		if math.Abs(gz) < gyroDeadzone { gz = 0 }
 	}
 
-	// 4. LOW PASS FILTER (wygładzanie szumu)
-	filtGX = lowPass(filtGX, gx)
-	filtGY = lowPass(filtGY, gy)
-	filtGZ = lowPass(filtGZ, gz)
-
-	gx = filtGX
-	gy = filtGY
-	gz = filtGZ
-
-	// 5. ADAPTACYJNA DEADZONE
-	if math.Abs(gx) < gyroDeadzone {
-		gx = 0
-	}
-	if math.Abs(gy) < gyroDeadzone {
-		gy = 0
-	}
-	if math.Abs(gz) < gyroDeadzone {
-		gz = 0
-	}
-
-	// 6. AKCELEROMETR (Prawdziwe dane, bez fałszowania grawitacji!)
+	// 6. AKCELEROMETR (Zawsze prawdziwe dane do Sensor Fusion!)
 	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665))
 	ay := sanitizeFloat32(float32(sample.Accel.Y / 9.80665))
 	az := sanitizeFloat32(float32(sample.Accel.Z / 9.80665))
 
-	// 7. KONWERSJA I WYSYŁKA
+	// 7. KONWERSJA ŻYROSKOPU
 	const rad2deg = 180.0 / math.Pi
 	gxOut := sanitizeFloat32(float32(gx * rad2deg))
 	gyOut := sanitizeFloat32(float32(gy * rad2deg))
 	gzOut := sanitizeFloat32(float32(gz * rad2deg))
 
-	// Utrzymujemy oryginalny timestamp (sample.TSus), aby zachować interwały kernela
+	// 8. WYSYŁKA (Wspólna dla kalibracji i normalnej pracy)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range s.subs {
@@ -430,6 +428,7 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 		s.conn.WriteToUDP(pkt, a)
 	}
 
+	// 9. UTRZYMANIE POŁĄCZENIA (Heartbeat)
 	now := time.Now()
 	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
 		pktInfo := s.buildControllerInfo(0, 2)
@@ -442,6 +441,7 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 		s.lastInfo = now
 	}
 }
+
 func (s *DSUServer) buildPacket(msgType uint32, payload []byte) []byte {
     // Citron/Yuzu expects payload_length = sizeof(Type) + sizeof(Data)
     // Type in protocol is u32 (4 bytes).
