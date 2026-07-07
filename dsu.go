@@ -15,6 +15,94 @@ import (
 	"encoding/hex"
 )
 
+// --- STRUKTURA PRZETWARZANIA IMU ---
+type IMUProcessor struct {
+	mu sync.Mutex
+
+	// Kalibracja
+	calibrating  bool
+	samplesCount int
+	biasX, biasY, biasZ float64
+
+	// Freeze detector
+	lastRawX, lastRawY, lastRawZ float64
+	duplicateCount int
+	isFrozen       bool
+
+	// LPF
+	lpfX, lpfY, lpfZ float64
+}
+
+var processor = &IMUProcessor{calibrating: true}
+
+const (
+	eps                   = 0.0005 // Epsilon dla błędu pływającego
+	freezeLimit           = 20     // Ilość klatek do uznania zamrożenia (ok. 50-80ms)
+	alpha                 = 0.85   // Współczynnik Low Pass Filter
+	maxCalibrationSamples = 200    // Pula próbek do wyliczenia biasu
+)
+
+func equal(a, b float64) bool {
+	return math.Abs(a-b) < eps
+}
+
+func (p *IMUProcessor) Process(sample *IMUSample) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// 1. Freeze Detector na surowych danych
+	if equal(sample.Gyro.X, p.lastRawX) && equal(sample.Gyro.Y, p.lastRawY) && equal(sample.Gyro.Z, p.lastRawZ) {
+		p.duplicateCount++
+		if p.duplicateCount >= freezeLimit {
+			p.isFrozen = true
+		}
+	} else {
+		p.duplicateCount = 0
+		p.isFrozen = false
+		p.lastRawX = sample.Gyro.X
+		p.lastRawY = sample.Gyro.Y
+		p.lastRawZ = sample.Gyro.Z
+	}
+
+	if p.isFrozen {
+		sample.Gyro.X, sample.Gyro.Y, sample.Gyro.Z = 0, 0, 0
+		p.lpfX, p.lpfY, p.lpfZ = 0, 0, 0 
+		return
+	}
+
+	// 2. Zbieranie biasu po uruchomieniu (konsola musi leżeć płasko)
+	if p.calibrating {
+		p.biasX += sample.Gyro.X
+		p.biasY += sample.Gyro.Y
+		p.biasZ += sample.Gyro.Z
+		p.samplesCount++
+		if p.samplesCount >= maxCalibrationSamples {
+			p.biasX /= float64(maxCalibrationSamples)
+			p.biasY /= float64(maxCalibrationSamples)
+			p.biasZ /= float64(maxCalibrationSamples)
+			p.calibrating = false
+		}
+		sample.Gyro.X, sample.Gyro.Y, sample.Gyro.Z = 0, 0, 0
+		return
+	}
+
+	// 3. Bias Correction
+	gx := sample.Gyro.X - p.biasX
+	gy := sample.Gyro.Y - p.biasY
+	gz := sample.Gyro.Z - p.biasZ
+
+	// 4. Low Pass Filter (wyciszenie szumu wysokiej częstotliwości)
+	p.lpfX = alpha*p.lpfX + (1.0-alpha)*gx
+	p.lpfY = alpha*p.lpfY + (1.0-alpha)*gy
+	p.lpfZ = alpha*p.lpfZ + (1.0-alpha)*gz
+
+	// Zapis do oryginalnej struktury
+	sample.Gyro.X = p.lpfX
+	sample.Gyro.Y = p.lpfY
+	sample.Gyro.Z = p.lpfZ
+}
+// --- KONIEC STRUKTURY ---
+
 const (
 	dsuProtoVersion uint16 = 1001
 	// Message types (little endian values)
@@ -232,73 +320,30 @@ var emaInitialized bool
 
 // Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	now := time.Now()
+	// Aplikacja całego potoku transformacji na próbce przed propagacją
+	processor.Process(&sample)
+
+	// convert units for DSU and sanitize to prevent NaN/Infinity crashes
+	// Akcelerometr przepuszczony w formie czystej dla zachowania poprawności Sensor Fusion (Mahony/Madgwick)
+	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665)) // m/s^2 → g
+	ay := sanitizeFloat32(float32(sample.Accel.Y / 9.80665))
+	az := sanitizeFloat32(float32(sample.Accel.Z / 9.80665))
 	
-	// 1. ZAWÓR ANTY-LAGOWY (Anti-Buffer Bloat)
-	// Jeśli system wymiotuje zablokowanymi w buforze pakietami szybciej niż co 5ms (200Hz),
-	// bezlitośnie je ignorujemy. Dzięki temu zawsze jesteśmy w czasie rzeczywistym.
-	if now.Sub(lastBroadcast) < 5*time.Millisecond {
-		return 
-	}
-	lastBroadcast = now
-
-	// 2. NAPRAWA CZASU (Omijamy uszkodzone timestampy jądra SteamOS)
-	tsUS := uint64(time.Since(serverStartTime).Microseconds())
-
-	// 3. NAPRAWA AKCELEROMETRU (Low-Pass Filter)
-	// Przywracamy grawitację, żeby emulator nie wariował (Sensor Fusion), 
-	// ale wygładzamy ją matematycznie, żeby zabić wibracje z obudowy.
-	alpha := 0.15 // Siła wygładzania (im niższa, tym płynniejszy odczyt)
-	
-	rawAx := sample.Accel.X / 9.80665
-	rawAy := sample.Accel.Y / 9.80665
-	rawAz := sample.Accel.Z / 9.80665
-
-	if !emaInitialized {
-		emaAx, emaAy, emaAz = rawAx, rawAy, rawAz
-		emaInitialized = true
-	} else {
-		emaAx = alpha*rawAx + (1.0-alpha)*emaAx
-		emaAy = alpha*rawAy + (1.0-alpha)*emaAy
-		emaAz = alpha*rawAz + (1.0-alpha)*emaAz
-	}
-
-	ax := sanitizeFloat32(float32(emaAx))
-	ay := sanitizeFloat32(float32(emaAy))
-	az := sanitizeFloat32(float32(emaAz))
-
-	// 4. SMART FILTR ŻYROSKOPU (Drop zamiast Clamp)
-	const gyroDeadzone = 0.03   // Solidna strefa martwa
-	const gyroSpikeLimit = 15.0 // Powyżej 15 rad/s rąk nie wykręcisz
-
-	filterGyro := func(val float64) float64 {
-		// Odcinamy mikroszumy na biurku
-		if math.Abs(val) < gyroDeadzone { 
-			return 0.0 
-		}
-		// GENIALNA ZMIANA: Jeśli sterownik ma czkawkę i rzuca kosmosem, 
-		// ignorujemy ten odczyt (0.0), a nie każemy kamerze szarpać!
-		if math.Abs(val) > gyroSpikeLimit { 
-			return 0.0 
-		}
-		return val
-	}
-
 	const rad2deg = 180.0 / math.Pi
-	
-	gx := sanitizeFloat32(float32(filterGyro(sample.Gyro.X) * rad2deg))
-	gy := sanitizeFloat32(float32(filterGyro(sample.Gyro.Y) * rad2deg))
-	gz := sanitizeFloat32(float32(filterGyro(sample.Gyro.Z) * rad2deg))
+	gx := sanitizeFloat32(float32(sample.Gyro.X * rad2deg)) // rad/s → deg/s
+	gy := sanitizeFloat32(float32(sample.Gyro.Y * rad2deg))
+	gz := sanitizeFloat32(float32(sample.Gyro.Z * rad2deg))
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range s.subs {
 		s.pkt++
-		pkt := s.buildControllerData(0, true, s.pkt, tsUS, ax, ay, az, gx, gy, gz)
+		pkt := s.buildControllerData(0, true, s.pkt, sample.TSus, ax, ay, az, gx, gy, gz)
 		if s.debug && (s.pkt%100 == 1) { dumpPacket("TX", pkt) } 
 		s.conn.WriteToUDP(pkt, a)
 	}
 	
+	now := time.Now()
 	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
 		pktInfo := s.buildControllerInfo(0, 2)
 		for _, a := range s.subs {
@@ -308,7 +353,6 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 		s.lastInfo = now
 	}
 }
-
 func (s *DSUServer) buildPacket(msgType uint32, payload []byte) []byte {
     // Citron/Yuzu expects payload_length = sizeof(Type) + sizeof(Data)
     // Type in protocol is u32 (4 bytes).
