@@ -17,28 +17,40 @@ import (
 
 // --- START ZMIENNYCH GLOBALNYCH DLA FILTRA ---
 var (
-	gyroBiasX float64
-	gyroBiasY float64
-	gyroBiasZ float64
-
-	filtGX float64
-	filtGY float64
-	filtGZ float64
-
+	bGX, bGY, bGZ float64
+	fGX, fGY, fGZ float64
+	fAX, fAY, fAZ float64
+	lastRawX, lastRawY, lastRawZ float64
+	lastTS uint64
+	freezeCount int
 	initialized bool
-
 	calibSamples int
-	calibX       float64
-	calibY       float64
-	calibZ       float64
+	sumX, sumY, sumZ float64
+	stillCount int
 )
 
 const (
-	calibrationFrames = 300
-	alpha             = 0.60  // Zmniejszono z 0.90 - zapobiega efektowi "zamulenia" kamery
-	gyroDeadzone      = 0.004
-	spikeLimit        = 8.0   // ok. 450 stopni na sekundę (ludzka ręka rzadko tyle osiąga)
+	calibFrames = 250
+	alphaG = 0.65
+	alphaA = 0.15 
+	deadzone = 0.003
+	maxDelta = 0.8
+	stillThresh = 0.0015
+	freezeLim = 20
+	biasSanity = 0.15
+	eps = 0.00001
 )
+
+func equal(a, b float64) bool { 
+	return math.Abs(a-b) < eps 
+}
+
+func clampDelta(prev, current, limit float64) float64 {
+	delta := current - prev
+	if delta > limit { return prev + limit }
+	if delta < -limit { return prev - limit }
+	return current
+}
 
 func lowPass(prev, current float64) float64 {
 	return alpha*prev + (1.0-alpha)*current
@@ -70,10 +82,6 @@ const (
 	alpha                 = 0.85   // Współczynnik Low Pass Filter
 	maxCalibrationSamples = 200    // Pula próbek do wyliczenia biasu
 )
-
-func equal(a, b float64) bool {
-	return math.Abs(a-b) < eps
-}
 
 func (p *IMUProcessor) Process(sample *IMUSample) {
 	p.mu.Lock()
@@ -348,94 +356,122 @@ var emaAx, emaAy, emaAz float64
 var emaInitialized bool
 
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	gx := sample.Gyro.X
-	gy := sample.Gyro.Y
-	gz := sample.Gyro.Z
+	if math.IsNaN(sample.Gyro.X) || math.IsInf(sample.Gyro.X, 0) { return }
 
-	// BEZPIECZEŃSTWO: Odrzucanie sprzętowych błędów NaN/Inf z jądra Linuxa
-	if math.IsNaN(gx) || math.IsNaN(gy) || math.IsNaN(gz) || math.IsInf(gx, 0) {
-		return // Tę jedną, zepsutą klatkę możemy bezpiecznie usunąć
-	}
+	if sample.TSus <= lastTS && lastTS != 0 { return }
+	lastTS = sample.TSus
 
-	// 1. KALIBRACJA BIASU
-	if !initialized {
-		calibX += gx
-		calibY += gy
-		calibZ += gz
-		calibSamples++
-
-		if calibSamples >= calibrationFrames {
-			gyroBiasX = calibX / float64(calibrationFrames)
-			gyroBiasY = calibY / float64(calibrationFrames)
-			gyroBiasZ = calibZ / float64(calibrationFrames)
-			initialized = true
-			fmt.Printf("Kalibracja zakonczona. Bias -> X: %f, Y: %f, Z: %f\n", gyroBiasX, gyroBiasY, gyroBiasZ)
-		}
-
-		// NAPRAWA BŁĘDU LOGICZNEGO: 
-		// Nie używamy "return"! Wysyłamy do emulatora puste zera, 
-		// aby utrzymać połączenie z grą i nie zablokować wysyłki Info Packet.
-		gx, gy, gz = 0.0, 0.0, 0.0
-
+	if equal(sample.Gyro.X, lastRawX) && equal(sample.Gyro.Y, lastRawY) && equal(sample.Gyro.Z, lastRawZ) {
+		freezeCount++
+		if freezeCount >= freezeLim { return }
 	} else {
-		// --- NORMALNY PIPELINE PO KALIBRACJI ---
+		freezeCount = 0
+	}
+	lastRawX, lastRawY, lastRawZ = sample.Gyro.X, sample.Gyro.Y, sample.Gyro.Z
+
+	gx, gy, gz := sample.Gyro.X, sample.Gyro.Y, sample.Gyro.Z
+
+	if !initialized {
+		if math.Abs(gx) < 0.015 && math.Abs(gy) < 0.015 && math.Abs(gz) < 0.015 {
+			sumX += gx
+			sumY += gy
+			sumZ += gz
+			calibSamples++
+			
+			if calibSamples >= calibFrames {
+				bGX = sumX / float64(calibFrames)
+				bGY = sumY / float64(calibFrames)
+				bGZ = sumZ / float64(calibFrames)
+				
+				if math.Abs(bGX) > biasSanity || math.Abs(bGY) > biasSanity || math.Abs(bGZ) > biasSanity {
+					calibSamples, sumX, sumY, sumZ = 0, 0, 0, 0 
+				} else {
+					initialized = true
+				}
+			}
+		} else {
+			calibSamples, sumX, sumY, sumZ = 0, 0, 0, 0 
+		}
 		
-		// 2. ODEJMOWANIE BIASU (usunięcie głównego źródła dryftu)
-		gx -= gyroBiasX
-		gy -= gyroBiasY
-		gz -= gyroBiasZ
-
-		// 3. SPIKE KILLER
-		if math.Abs(gx) > spikeLimit { gx = filtGX }
-		if math.Abs(gy) > spikeLimit { gy = filtGY }
-		if math.Abs(gz) > spikeLimit { gz = filtGZ }
-
-		// 4. LOW PASS FILTER (wygładzanie szumu)
-		filtGX = lowPass(filtGX, gx)
-		filtGY = lowPass(filtGY, gy)
-		filtGZ = lowPass(filtGZ, gz)
-
-		gx = filtGX
-		gy = filtGY
-		gz = filtGZ
-
-		// 5. ADAPTACYJNA DEADZONE
-		if math.Abs(gx) < gyroDeadzone { gx = 0 }
-		if math.Abs(gy) < gyroDeadzone { gy = 0 }
-		if math.Abs(gz) < gyroDeadzone { gz = 0 }
+		s.sendHeartbeatOnly()
+		return
 	}
 
-	// 6. AKCELEROMETR (Zawsze prawdziwe dane do Sensor Fusion!)
-	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665))
-	ay := sanitizeFloat32(float32(sample.Accel.Y / 9.80665))
-	az := sanitizeFloat32(float32(sample.Accel.Z / 9.80665))
+	if math.Abs(gx-bGX) < stillThresh && math.Abs(gy-bGY) < stillThresh && math.Abs(gz-bGZ) < stillThresh {
+		stillCount++
+		if stillCount > 150 {
+			bGX = bGX*0.9995 + gx*0.0005
+			bGY = bGY*0.9995 + gy*0.0005
+			bGZ = bGZ*0.9995 + gz*0.0005
+		}
+	} else {
+		stillCount = 0
+	}
 
-	// 7. KONWERSJA ŻYROSKOPU
+	gx -= bGX
+	gy -= bGY
+	gz -= bGZ
+
+	if math.Abs(gx) < deadzone { gx = 0 }
+	if math.Abs(gy) < deadzone { gy = 0 }
+	if math.Abs(gz) < deadzone { gz = 0 }
+
+	gx = clampDelta(fGX, gx, maxDelta)
+	gy = clampDelta(fGY, gy, maxDelta)
+	gz = clampDelta(fGZ, gz, maxDelta)
+
+	fGX = alphaG*fGX + (1.0-alphaG)*gx
+	fGY = alphaG*fGY + (1.0-alphaG)*gy
+	fGZ = alphaG*fGZ + (1.0-alphaG)*gz
+
+	axR := sample.Accel.X / 9.80665
+	ayR := sample.Accel.Y / 9.80665
+	azR := sample.Accel.Z / 9.80665
+
+	if fAX == 0 && fAY == 0 && fAZ == 0 {
+		fAX, fAY, fAZ = axR, ayR, azR
+	} else {
+		fAX = alphaA*fAX + (1.0-alphaA)*axR
+		fAY = alphaA*fAY + (1.0-alphaA)*ayR
+		fAZ = alphaA*fAZ + (1.0-alphaA)*azR
+	}
+
+	ax := sanitizeFloat32(float32(fAX))
+	ay := sanitizeFloat32(float32(fAY))
+	az := sanitizeFloat32(float32(fAZ))
+
 	const rad2deg = 180.0 / math.Pi
-	gxOut := sanitizeFloat32(float32(gx * rad2deg))
-	gyOut := sanitizeFloat32(float32(gy * rad2deg))
-	gzOut := sanitizeFloat32(float32(gz * rad2deg))
+	gxOut := sanitizeFloat32(float32(fGX * rad2deg))
+	gyOut := sanitizeFloat32(float32(fGY * rad2deg))
+	gzOut := sanitizeFloat32(float32(fGZ * rad2deg))
 
-	// 8. WYSYŁKA (Wspólna dla kalibracji i normalnej pracy)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range s.subs {
 		s.pkt++
 		pkt := s.buildControllerData(0, true, s.pkt, sample.TSus, ax, ay, az, gxOut, gyOut, gzOut)
-		if s.debug && (s.pkt%100 == 1) { 
-			dumpPacket("TX", pkt) 
-		}
+		if s.debug && (s.pkt%100 == 1) { dumpPacket("TX", pkt) }
 		s.conn.WriteToUDP(pkt, a)
 	}
 
-	// 9. UTRZYMANIE POŁĄCZENIA (Heartbeat)
 	now := time.Now()
 	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
 		pktInfo := s.buildControllerInfo(0, 2)
 		for _, a := range s.subs {
-			if s.debug { 
-				dumpPacket("TX", pktInfo) 
-			}
+			if s.debug { dumpPacket("TX", pktInfo) }
+			s.conn.WriteToUDP(pktInfo, a)
+		}
+		s.lastInfo = now
+	}
+}
+
+func (s *DSUServer) sendHeartbeatOnly() {
+	now := time.Now()
+	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		pktInfo := s.buildControllerInfo(0, 2)
+		for _, a := range s.subs {
 			s.conn.WriteToUDP(pktInfo, a)
 		}
 		s.lastInfo = now
