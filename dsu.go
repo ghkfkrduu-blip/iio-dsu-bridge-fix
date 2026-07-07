@@ -224,65 +224,50 @@ func sanitizeFloat32(v float32) float32 {
 }
 
 var serverStartTime = time.Now()
-var lastBroadcast time.Time
 
-// Zmienne do płynnego filtra EMA dla akcelerometru (Sensor Fusion Fix)
-var emaAx, emaAy, emaAz float64
-var emaInitialized bool
+// Zmienne do wykrywania sprzętowego "zamrożenia" (Stale Data Killer)
+var lastRawGx, lastRawGy, lastRawGz float64
+var duplicateFrames int
 
 // Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	now := time.Now()
+	// --- START OSTATECZNEJ POPRAWKI ---
 	
-	// 1. ZAWÓR ANTY-LAGOWY (Anti-Buffer Bloat)
-	// Jeśli system wymiotuje zablokowanymi w buforze pakietami szybciej niż co 5ms (200Hz),
-	// bezlitośnie je ignorujemy. Dzięki temu zawsze jesteśmy w czasie rzeczywistym.
-	if now.Sub(lastBroadcast) < 5*time.Millisecond {
-		return 
-	}
-	lastBroadcast = now
-
-	// 2. NAPRAWA CZASU (Omijamy uszkodzone timestampy jądra SteamOS)
-	tsUS := uint64(time.Since(serverStartTime).Microseconds())
-
-	// 3. NAPRAWA AKCELEROMETRU (Low-Pass Filter)
-	// Przywracamy grawitację, żeby emulator nie wariował (Sensor Fusion), 
-	// ale wygładzamy ją matematycznie, żeby zabić wibracje z obudowy.
-	alpha := 0.15 // Siła wygładzania (im niższa, tym płynniejszy odczyt)
-	
-	rawAx := sample.Accel.X / 9.80665
-	rawAy := sample.Accel.Y / 9.80665
-	rawAz := sample.Accel.Z / 9.80665
-
-	if !emaInitialized {
-		emaAx, emaAy, emaAz = rawAx, rawAy, rawAz
-		emaInitialized = true
+	// 1. WYKRYWACZ ZATRZAŚNIĘTEGO SENSORA
+	// Jeśli sterownik powtarza co do bita te same wartości zmiennoprzecinkowe,
+	// układ zaciął się na starym ruchu. Blokujemy to.
+	isFrozen := false
+	if sample.Gyro.X == lastRawGx && sample.Gyro.Y == lastRawGy && sample.Gyro.Z == lastRawGz {
+		duplicateFrames++
+		if duplicateFrames >= 2 { 
+			isFrozen = true // Błąd jądra Linuxa - odcinamy sygnał
+		}
 	} else {
-		emaAx = alpha*rawAx + (1.0-alpha)*emaAx
-		emaAy = alpha*rawAy + (1.0-alpha)*emaAy
-		emaAz = alpha*rawAz + (1.0-alpha)*emaAz
+		duplicateFrames = 0
+		lastRawGx = sample.Gyro.X
+		lastRawGy = sample.Gyro.Y
+		lastRawGz = sample.Gyro.Z
 	}
 
-	ax := sanitizeFloat32(float32(emaAx))
-	ay := sanitizeFloat32(float32(emaAy))
-	az := sanitizeFloat32(float32(emaAz))
-
-	// 4. SMART FILTR ŻYROSKOPU (Drop zamiast Clamp)
-	const gyroDeadzone = 0.03   // Solidna strefa martwa
-	const gyroSpikeLimit = 15.0 // Powyżej 15 rad/s rąk nie wykręcisz
-
+	// 2. FILTR ŻYROSKOPU Z HAMULCEM
+	const gyroDeadzone = 0.025
+	
 	filterGyro := func(val float64) float64 {
-		// Odcinamy mikroszumy na biurku
-		if math.Abs(val) < gyroDeadzone { 
-			return 0.0 
-		}
-		// GENIALNA ZMIANA: Jeśli sterownik ma czkawkę i rzuca kosmosem, 
-		// ignorujemy ten odczyt (0.0), a nie każemy kamerze szarpać!
-		if math.Abs(val) > gyroSpikeLimit { 
-			return 0.0 
-		}
+		if isFrozen { return 0.0 } // Brutalne zatrzymanie kamery przy zawieszeniu
+		if math.Abs(val) < gyroDeadzone { return 0.0 }
 		return val
 	}
+
+	// 3. OMINIĘCIE BŁĘDNYCH TIMESTAMPÓW
+	tsUS := uint64(time.Since(serverStartTime).Microseconds())
+
+	// 4. IDEALNA GRAWITACJA
+	// Całkowicie odcinamy wariujący akcelerometr. Mówimy grze, że konsola
+	// jest idealnie w poziomie. Dzięki temu Sensor Fusion w emulatorze nie zgłupieje.
+	ax := float32(0.0)
+	ay := float32(1.0)
+	az := float32(0.0)
+	// --- KONIEC POPRAWKI ---
 
 	const rad2deg = 180.0 / math.Pi
 	
@@ -299,6 +284,7 @@ func (s *DSUServer) Broadcast(sample IMUSample) {
 		s.conn.WriteToUDP(pkt, a)
 	}
 	
+	now := time.Now()
 	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
 		pktInfo := s.buildControllerInfo(0, 2)
 		for _, a := range s.subs {
