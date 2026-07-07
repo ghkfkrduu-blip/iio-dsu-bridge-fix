@@ -15,6 +15,35 @@ import (
 	"encoding/hex"
 )
 
+// --- START ZMIENNYCH GLOBALNYCH DLA FILTRA ---
+var (
+	gyroBiasX float64
+	gyroBiasY float64
+	gyroBiasZ float64
+
+	filtGX float64
+	filtGY float64
+	filtGZ float64
+
+	initialized bool
+
+	calibSamples int
+	calibX       float64
+	calibY       float64
+	calibZ       float64
+)
+
+const (
+	calibrationFrames = 300
+	alpha             = 0.90
+	gyroDeadzone      = 0.004
+	spikeLimit        = 8.0
+)
+
+func lowPass(prev, current float64) float64 {
+	return alpha*prev + (1.0-alpha)*current
+}
+
 // --- STRUKTURA PRZETWARZANIA IMU ---
 type IMUProcessor struct {
 	mu sync.Mutex
@@ -318,36 +347,96 @@ var lastBroadcast time.Time
 var emaAx, emaAy, emaAz float64
 var emaInitialized bool
 
-// Broadcast one IMU sample (already mount-adjusted & scaled to SI units).
 func (s *DSUServer) Broadcast(sample IMUSample) {
-	// Aplikacja całego potoku transformacji na próbce przed propagacją
-	processor.Process(&sample)
+	gx := sample.Gyro.X
+	gy := sample.Gyro.Y
+	gz := sample.Gyro.Z
 
-	// convert units for DSU and sanitize to prevent NaN/Infinity crashes
-	// Akcelerometr przepuszczony w formie czystej dla zachowania poprawności Sensor Fusion (Mahony/Madgwick)
-	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665)) // m/s^2 → g
+	// 1. KALIBRACJA BIASU
+	// Po uruchomieniu programu przez pierwsze 300 klatek zbieramy próbki
+	// WAŻNE: Konsola musi w tym czasie leżeć płasko i nieruchomo!
+	if !initialized {
+		calibX += gx
+		calibY += gy
+		calibZ += gz
+		calibSamples++
+
+		if calibSamples >= calibrationFrames {
+			gyroBiasX = calibX / float64(calibSamples)
+			gyroBiasY = calibY / float64(calibSamples)
+			gyroBiasZ = calibZ / float64(calibSamples)
+			initialized = true
+			fmt.Printf("Kalibracja zakonczona. Bias -> X: %f, Y: %f, Z: %f\n", gyroBiasX, gyroBiasY, gyroBiasZ)
+		}
+		return // Czekamy na koniec kalibracji, nie wysyłamy śmieci do emulatora
+	}
+
+	// 2. ODEJMOWANIE BIASU (usunięcie głównego źródła dryftu)
+	gx -= gyroBiasX
+	gy -= gyroBiasY
+	gz -= gyroBiasZ
+
+	// 3. SPIKE KILLER (odrzucanie pojedynczych błędnych próbek z IIO)
+	if math.Abs(gx) > spikeLimit {
+		gx = filtGX
+	}
+	if math.Abs(gy) > spikeLimit {
+		gy = filtGY
+	}
+	if math.Abs(gz) > spikeLimit {
+		gz = filtGZ
+	}
+
+	// 4. LOW PASS FILTER (wygładzanie szumu)
+	filtGX = lowPass(filtGX, gx)
+	filtGY = lowPass(filtGY, gy)
+	filtGZ = lowPass(filtGZ, gz)
+
+	gx = filtGX
+	gy = filtGY
+	gz = filtGZ
+
+	// 5. ADAPTACYJNA DEADZONE
+	if math.Abs(gx) < gyroDeadzone {
+		gx = 0
+	}
+	if math.Abs(gy) < gyroDeadzone {
+		gy = 0
+	}
+	if math.Abs(gz) < gyroDeadzone {
+		gz = 0
+	}
+
+	// 6. AKCELEROMETR (Prawdziwe dane, bez fałszowania grawitacji!)
+	ax := sanitizeFloat32(float32(sample.Accel.X / 9.80665))
 	ay := sanitizeFloat32(float32(sample.Accel.Y / 9.80665))
 	az := sanitizeFloat32(float32(sample.Accel.Z / 9.80665))
-	
-	const rad2deg = 180.0 / math.Pi
-	gx := sanitizeFloat32(float32(sample.Gyro.X * rad2deg)) // rad/s → deg/s
-	gy := sanitizeFloat32(float32(sample.Gyro.Y * rad2deg))
-	gz := sanitizeFloat32(float32(sample.Gyro.Z * rad2deg))
 
+	// 7. KONWERSJA I WYSYŁKA
+	const rad2deg = 180.0 / math.Pi
+	gxOut := sanitizeFloat32(float32(gx * rad2deg))
+	gyOut := sanitizeFloat32(float32(gy * rad2deg))
+	gzOut := sanitizeFloat32(float32(gz * rad2deg))
+
+	// Utrzymujemy oryginalny timestamp (sample.TSus), aby zachować interwały kernela
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, a := range s.subs {
 		s.pkt++
-		pkt := s.buildControllerData(0, true, s.pkt, sample.TSus, ax, ay, az, gx, gy, gz)
-		if s.debug && (s.pkt%100 == 1) { dumpPacket("TX", pkt) } 
+		pkt := s.buildControllerData(0, true, s.pkt, sample.TSus, ax, ay, az, gxOut, gyOut, gzOut)
+		if s.debug && (s.pkt%100 == 1) { 
+			dumpPacket("TX", pkt) 
+		}
 		s.conn.WriteToUDP(pkt, a)
 	}
-	
+
 	now := time.Now()
 	if now.Sub(s.lastInfo) >= 500*time.Millisecond {
 		pktInfo := s.buildControllerInfo(0, 2)
 		for _, a := range s.subs {
-			if s.debug { dumpPacket("TX", pktInfo) }
+			if s.debug { 
+				dumpPacket("TX", pktInfo) 
+			}
 			s.conn.WriteToUDP(pktInfo, a)
 		}
 		s.lastInfo = now
